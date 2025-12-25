@@ -16,7 +16,7 @@ engine = create_engine(db_url)
 def wait_for_db(max_retries=10, delay=5):
     for attempt in range(max_retries):
         try:
-            with engine.connect() as conn:
+            with engine.connect() as conn: 
                 conn.execute(text("SELECT 1"))
             print("Database connection established.")
             return
