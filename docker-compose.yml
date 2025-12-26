@@ -7,10 +7,9 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_HOST_AUTH_METHOD: md5
-
+      postgres_host_auth_method: "md5"
     ports:
-      - 5432:5432
+      - "5432:5432"
     command:
       [
         "postgres",
@@ -37,5 +36,194 @@ services:
       POSTGRES_PORT: 5432
     restart: always
 
+  cassandra:
+    image: cassandra:5.0
+    container_name: cassandra
+    restart: always
+    ports:
+      - "9042:9042"
+    environment:
+      CASSANDRA_CLUSTER_NAME: "CryptoCluster"
+      CASSANDRA_NUM_TOKENS: 4
+      CASSANDRA_START_RPC: "true"
+      MAX_HEAP_SIZE: 512M
+      HEAP_NEWSIZE: 100M
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'describe keyspaces'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  cassandra-init:
+    image: cassandra:5.0
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    volumes:
+      - ./scripts/init_cassandra.cql:/init/init_cassandra.cql
+    entrypoint:
+      [
+        "/bin/bash",
+        "-c",
+        "sleep 10 && cqlsh cassandra -f /init/init_cassandra.cql",
+      ]
+
+  zookeeper:
+    image: debezium/zookeeper:2.6
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c 'exec 3<>/dev/tcp/127.0.0.1/2181 && echo srvr >&3 && cat <&3 | grep -q Mode'",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: debezium/kafka:2.6
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      # Connect to Zookeeper service via its Docker network name
+      ZOOKEEPER_CONNECT: zookeeper:2181
+
+      # listeners: internal (for Docker network) and host (for you)
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      # Safe single-broker settings
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
+      # Misc
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    # give zookeeper extra time before trying connection
+    entrypoint: ["bash", "-c", "sleep 10 && /docker-entrypoint.sh start"]
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'bash -c ''exec 3<>/dev/tcp/localhost/9092 && echo -e "" >&3'' || exit 1',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  connect:
+    image: debezium/connect:2.6
+    container_name: debezium-connect
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_started
+      cassandra:
+        condition: service_started
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: 1
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      STATUS_STORAGE_TOPIC: connect_statuses
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      DEBEZIUM_LOG_LEVEL: INFO
+      ENABLE_DEBEZIUM_SCRIPTING: "true"
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_PLUGIN_PATH: /kafka/connect,/connect-plugins
+    volumes:
+      - ./connect-plugins:/connect-plugins
+      - ./connectors:/connectors
+      - ./connect-plugins/convert_fetch_time.js:/opt/kafka/connect-scripts/convert_fetch_time.js
+    # Let the default entrypoint run, then register connectors
+    command: >
+      bash -c "
+        # Start Kafka Connect with default entrypoint
+        /docker-entrypoint.sh start &
+        
+        # Wait for Kafka Connect REST API to become available
+        echo 'Waiting for Kafka Connect to start...';
+        sleep 60;
+        
+        until curl -s http://localhost:8083/connectors > /dev/null; do
+          echo 'Still waiting for Kafka Connect REST API...';
+          sleep 10;
+        done;
+
+        echo 'Kafka Connect is up. Registering connectors...';
+        for f in /connectors/*.json; do
+          name=$$(basename \"$$f\" .json);
+          echo \"Registering connector: $$name\";
+          curl -s -X PUT -H 'Content-Type: application/json' --data @\"$$f\" http://localhost:8083/connectors/$$name/config;
+        done;
+
+        # Wait forever (keep container alive)
+        wait
+      "
+
+
+
+
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - cassandra
+    
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    restart: always
+    ports:
+      - "8080:8080"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: "LocalKafka"
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: "kafka:9092"
+      KAFKA_CLUSTERS_0_ZOOKEEPER: "zookeeper:2181"
+      # Optional: enable schema registry if you use it
+      # KAFKA_CLUSTERS_0_SCHEMAREGISTRY: "http://schema-registry:8081"
+      SERVER_PORT: 8080
+
+
+
 volumes:
+  cassandra_data:
   pg_data:
+  grafana_data:
